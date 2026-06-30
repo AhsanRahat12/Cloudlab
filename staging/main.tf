@@ -11,7 +11,7 @@ resource "azurerm_kubernetes_cluster" "main" {
   location            = azurerm_resource_group.aks.location
   resource_group_name = azurerm_resource_group.aks.name
   dns_prefix          = "staging"
-  kubernetes_version  = "1.32.1"
+  kubernetes_version  = "1.34.8"
 
   azure_active_directory_role_based_access_control {
     admin_group_object_ids = ["11d8fbe7-4ce4-4d24-a04b-c489e4cde806"]
