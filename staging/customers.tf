@@ -11,7 +11,7 @@ locals {
 
   environment      = "staging"
   domain           = "cloudlab.rahatahsan.com"
-  gitops_repo_path = "/home/rahat/Projects/Cloudlab/gitops"
+  gitops_repo_path = "/home/rahat/Projects/Cloudlab"
 
   customers_sorted = sort(tolist(local.customers))
 }
