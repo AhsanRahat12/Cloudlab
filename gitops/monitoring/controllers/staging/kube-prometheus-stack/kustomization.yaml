@@ -12,10 +12,10 @@ patches:
     patch: |-
       - op: replace
         path: /spec/parameters/userAssignedIdentityID
-        value: "PLACEHOLDER_WILL_UPDATE_AFTER_APPLY"
+        value: "8f42f940-22dc-4a0e-aec9-3ac5ab24d19a"
       - op: replace
         path: /spec/parameters/tenantId
-        value: "PLACEHOLDER_WILL_UPDATE_AFTER_APPLY"
+        value: "7ec184ef-0661-4d19-935b-b0f746d3e8a7"
 configMapGenerator:
   - name: kube-prometheus-stack-values
     namespace: flux-system
