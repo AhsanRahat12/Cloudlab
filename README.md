@@ -20,30 +20,6 @@ Every customer is a Postgres database (CloudNative-PG) plus an n8n instance, net
 
 ## 🗺️ Architecture
 
-**Provisioning & GitOps flow** — Terraform builds the Azure resources and writes this repo; Flux reads this repo back into the cluster through a dependency-chained set of Kustomizations.
-
-```mermaid
-flowchart LR
-    subgraph Terraform["Terraform (staging / production root modules)"]
-        A1["AKS cluster + node pools"]
-        A2["Key Vault"]
-        A3["Storage account"]
-        A4["customer-onboarding module"]
-    end
-
-    Terraform -->|apply| Azure[("Azure resources")]
-    A4 -->|"generates manifests + kustomization.yaml"| Git[("Cloudlab Git repo")]
-
-    Git -->|"git pull, every 5 min"| Flux["Flux AKS extension"]
-
-    Flux --> K1["infra-controllers<br/>Traefik, cert-manager, CNPG operator"]
-    K1 --> K2["infra-configs<br/>ClusterIssuers"]
-    K2 --> K3["cnpg-plugin<br/>Barman Cloud"]
-    K3 --> K4["apps<br/>per-customer manifests"]
-    K4 --> K5["monitoring-controllers<br/>kube-prometheus-stack"]
-    K5 --> K6["monitoring-configs<br/>Grafana alerts"]
-```
-
 **Per-customer runtime** — every tenant is the same shape: Traefik in front, n8n in the middle, a dedicated Postgres cluster behind it, secrets from Key Vault, backups to Blob, metrics to Prometheus.
 
 ```mermaid
