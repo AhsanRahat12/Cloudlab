@@ -8,6 +8,14 @@ A cloud platform where every customer gets their own isolated app, database, and
 
 > **Note on cost:** this cluster does not run 24/7. It's a demo/portfolio environment — spun up with `terraform apply` to demonstrate or test, then torn down with `terraform destroy` to avoid paying for idle AKS nodes and Azure resources around the clock.
 
+## TL;DR
+
+- **What it is** — a multi-tenant SaaS platform on Azure Kubernetes; each customer gets an isolated app, database, and backups.
+- **How customers get added** — one line in a Terraform file. Everything else (cloud resources, K8s config, DNS, TLS) is generated and deployed automatically.
+- **How it's operated** — GitOps end to end. Flux applies every change from this repo; nothing is deployed by hand.
+- **What's hardened** — per-tenant network isolation, Kubernetes' strictest security profile, continuous backups, alerting to Telegram.
+- **What it costs** — nothing when it's off. The cluster is provisioned on demand and torn down between demos.
+
 **Jump to:** [Philosophy](#philosophy) · [Architecture](#-architecture) · [Stack](#-stack) · [How to Run](#-how-to-run) · [Repository Structure](#-repository-structure) · [Customer Model](#-customer-model) · [Adding a New Customer](#-adding-a-new-customer) · [Infrastructure & Data](#-infrastructure--data) · [Notable Decisions](#-notable-decisions) · [Engineering Challenges](#-engineering-challenges) · [Connect](#-connect)
 
 ---
@@ -48,21 +56,14 @@ flowchart TB
 
 ## 🧰 Stack
 
-| Tool | Purpose |
-|------|---------|
-| Terraform | Builds the cloud infrastructure and generates each customer's Kubernetes config |
-| AKS | Azure's managed Kubernetes — runs the cluster; system components and customer apps use separate node pools so one can't starve the other |
-| Flux | Watches this Git repo and automatically applies changes to the cluster |
-| Kustomize | Reuses the same Kubernetes config across staging and production with small per-environment tweaks |
-| Cilium | Handles pod networking and the firewall rules between customers |
-| Traefik | Routes incoming web traffic to the right customer's app |
-| cert-manager | Automatically issues and renews HTTPS certificates |
-| Azure Key Vault + CSI driver | Stores passwords and tokens outside of Git, mounted into pods securely at startup |
-| CloudNative-PG | Runs and manages a dedicated Postgres database for each customer |
-| Barman Cloud plugin | Continuously backs up each customer's database to cloud storage |
-| n8n | The workflow-automation app each customer actually uses |
-| kube-prometheus-stack | Collects cluster metrics (Prometheus) and displays them (Grafana) |
-| Grafana alerting | Sends an alert to Telegram when something breaks (Alertmanager is disabled — Grafana handles this directly) |
+| Layer | Tools |
+|---|---|
+| Provisioning | Terraform |
+| Cluster | AKS · Flux · Kustomize |
+| Networking | Cilium · Traefik · cert-manager |
+| Data | CloudNative-PG · Barman Cloud · Azure Key Vault |
+| App | n8n |
+| Observability | Prometheus · Grafana (alerting → Telegram) |
 
 ---
 
@@ -143,19 +144,6 @@ Adding a name to `customers.tf` produces, via `modules/customer-onboarding`:
 - **Cloud resources** — a private storage container for backups, a time-limited access token, and secrets in Key Vault for the app's login and Telegram alerts.
 - **Everything needed to run their app** (`apps/<env>/<customer>/`) — a namespace, a database with automatic backups, the app itself, a public URL with HTTPS, network rules that wall them off from other customers, and a metrics hook.
 
-<details>
-<summary>Exact list of what gets generated ▶</summary>
-
-- Namespace, locked down with Kubernetes' strictest security profile (`restricted`)
-- `SecretProviderClass` pulling all 6 secrets from Key Vault
-- CNPG `Cluster` + `ObjectStore` + `ScheduledBackup` (daily, 14-day retention)
-- n8n `Deployment` (non-root, read-only filesystem, no extra permissions) + `Service` + persistent volume
-- Traefik `Ingress` with automatic HTTPS at `<customer>.cloudlab.rahatahsan.com`
-- `CiliumNetworkPolicy` — only Traefik can reach the app in, only the customer's own database can be reached out
-- `PodMonitor` for database metrics
-
-</details>
-
 Terraform writes each customer's directory itself, then regenerates the environment's `kustomization.yaml` listing every customer — so the file that wires everything into Flux is never hand-edited.
 
 Demo tenants (both environments, fictional): `luffy`, `zoro`, `nami`.
@@ -208,18 +196,10 @@ Once Flux reconciles the namespace, database, and n8n deployment (usually under 
 
 ## 🔧 Engineering Challenges
 
-Real problems I hit while building and running this — not tutorial steps. Eight of them, click each to expand.
+Real problems I hit while building and running this — not tutorial steps. Six of them, click each to expand.
 
 <details>
-<summary><b>1. A second Git repo hid all the config from Flux</b></summary>
-
-**Issue:** Accidentally initialized a second git repo inside the `gitops/` subdirectory, making all GitOps manifests invisible to the outer repo. Flux couldn't find any paths after push.
-**Solution:** Removed the nested `.git` folder, moved all manifests to repo root, updated `gitops_repo_path` in Terraform to match.
-
-</details>
-
-<details>
-<summary><b>2. Tailscale's DNS silently broke Terraform</b></summary>
+<summary><b>1. Tailscale's DNS silently broke Terraform</b></summary>
 
 **Issue:** `terraform init` failed to reach `registry.terraform.io` due to a misbehaving IPv6 DNS server injected by Tailscale.
 **Solution:** Overrode `/etc/resolv.conf` with Google DNS (`8.8.8.8`) to force IPv4 resolution.
@@ -227,7 +207,7 @@ Real problems I hit while building and running this — not tutorial steps. Eigh
 </details>
 
 <details>
-<summary><b>3. Wrong Kubernetes version required a paid support tier</b></summary>
+<summary><b>2. Wrong Kubernetes version required a paid support tier</b></summary>
 
 **Issue:** AKS rejected version `1.32.1` as it requires the Premium/LTS support plan in Canada Central.
 **Solution:** Queried supported versions with `az aks get-versions --location canadacentral` and pinned to `1.34.8`.
@@ -235,15 +215,7 @@ Real problems I hit while building and running this — not tutorial steps. Eigh
 </details>
 
 <details>
-<summary><b>4. A 231MB binary got committed to Git</b></summary>
-
-**Issue:** Running `terraform init` before creating `.gitignore` committed the Azure provider binary. GitHub rejected the push.
-**Solution:** Used `git filter-branch` to purge the binary from git history. Added `.gitignore` with `**/.terraform/` before any future `terraform init`.
-
-</details>
-
-<details>
-<summary><b>5. Flux silently refused a cross-namespace reference</b></summary>
+<summary><b>3. Flux silently refused a cross-namespace reference</b></summary>
 
 **Issue:** The database backup plugin's Helm release was defined in the `cnpg-system` namespace but pointed at a chart repository registered in `flux-system`. Flux blocks that kind of cross-namespace reference by default.
 **Solution:** Moved the release's metadata into `flux-system` (its target namespace stayed `cnpg-system`). Also had to manually delete the stale object, since Kubernetes won't move an existing resource to a new namespace in-place.
@@ -251,7 +223,7 @@ Real problems I hit while building and running this — not tutorial steps. Eigh
 </details>
 
 <details>
-<summary><b>6. An invalid version string made a Helm release silently do nothing</b></summary>
+<summary><b>4. An invalid version string made a Helm release silently do nothing</b></summary>
 
 **Issue:** Used `version: "0.x"` for the backup plugin's Helm chart, which isn't valid semver. Flux never processed it — no error, just nothing happening.
 **Solution:** Queried available versions with `helm search repo cnpg/plugin-barman-cloud --versions` and pinned to `0.7.0`.
@@ -259,7 +231,7 @@ Real problems I hit while building and running this — not tutorial steps. Eigh
 </details>
 
 <details>
-<summary><b>7. Every customer got a 404 with the wrong TLS certificate</b></summary>
+<summary><b>5. Every customer got a 404 with the wrong TLS certificate</b></summary>
 
 **Issue:** The Traefik chart version in use creates an ingress class named `traefik-traefik` by default, but every ingress manifest referenced `traefik`. Traefik ignored all of them, served its own self-signed certificate, and returned 404 everywhere.
 **Detection:** `kubectl get ingressclass` showed the mismatch; `openssl s_client` confirmed Traefik was serving its default cert instead of the real one.
@@ -268,7 +240,7 @@ Real problems I hit while building and running this — not tutorial steps. Eigh
 </details>
 
 <details>
-<summary><b>8. Ran out of disk slots for a 4th node</b></summary>
+<summary><b>6. Ran out of disk slots for a 4th node</b></summary>
 
 **Issue:** Each node type in use allows a maximum of 4 attached disks. With 3 customers × 3 database replicas + 3 app volumes = 12 volumes spread across 3 nodes, every disk slot was full — Prometheus couldn't get one for itself.
 **Attempted fix:** Adding a 4th node failed — not enough spare CPU quota left in the region.
