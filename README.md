@@ -2,6 +2,8 @@
 
 Multi-tenant SaaS platform on Azure AKS — Terraform provisions the cloud infrastructure and generates the GitOps manifests, Flux syncs them to the cluster. Onboarding a new customer is a one-line change to a Terraform list.
 
+> **Note on cost:** this cluster does not run 24/7. It's a demo/portfolio environment — spun up with `terraform apply` to demonstrate or test, then torn down with `terraform destroy` to avoid paying for idle AKS nodes and Azure resources around the clock.
+
 ---
 
 ## Philosophy
@@ -13,6 +15,52 @@ Customer onboarding is a single Terraform module (`modules/customer-onboarding`)
 Environments are fully isolated, not overlays of a shared base. `staging` and `production` are separate Terraform root modules, separate AKS clusters, separate Key Vaults, separate storage accounts — deliberately, so a mistake in staging can't touch production state.
 
 Every customer is a Postgres database (CloudNative-PG) plus an n8n instance, network-isolated with Cilium, backed up continuously to Azure Blob via the Barman Cloud plugin, and deployed under Pod Security Standards `restricted` from day one.
+
+---
+
+## 🗺️ Architecture
+
+**Provisioning & GitOps flow** — Terraform builds the Azure resources and writes this repo; Flux reads this repo back into the cluster through a dependency-chained set of Kustomizations.
+
+```mermaid
+flowchart LR
+    subgraph Terraform["Terraform (staging / production root modules)"]
+        A1["AKS cluster + node pools"]
+        A2["Key Vault"]
+        A3["Storage account"]
+        A4["customer-onboarding module"]
+    end
+
+    Terraform -->|apply| Azure[("Azure resources")]
+    A4 -->|"generates manifests + kustomization.yaml"| Git[("Cloudlab Git repo")]
+
+    Git -->|"git pull, every 5 min"| Flux["Flux AKS extension"]
+
+    Flux --> K1["infra-controllers<br/>Traefik, cert-manager, CNPG operator"]
+    K1 --> K2["infra-configs<br/>ClusterIssuers"]
+    K2 --> K3["cnpg-plugin<br/>Barman Cloud"]
+    K3 --> K4["apps<br/>per-customer manifests"]
+    K4 --> K5["monitoring-controllers<br/>kube-prometheus-stack"]
+    K5 --> K6["monitoring-configs<br/>Grafana alerts"]
+```
+
+**Per-customer runtime** — every tenant is the same shape: Traefik in front, n8n in the middle, a dedicated Postgres cluster behind it, secrets from Key Vault, backups to Blob, metrics to Prometheus.
+
+```mermaid
+flowchart TB
+    User(("Customer browser")) -->|HTTPS| Ingress["Traefik Ingress<br/>Let's Encrypt TLS"]
+    Ingress --> Service["n8n Service"]
+    Service --> Deployment["n8n Deployment<br/>non-root, read-only rootfs"]
+    Deployment -->|"CSI volume"| SPC["SecretProviderClass"]
+    SPC -->|reads| KeyVault[("Azure Key Vault")]
+    Deployment --> DB[("CNPG Postgres cluster")]
+    DB -->|"WAL archiving + daily backup"| Blob[("Customer Blob container")]
+    DB --> PodMonitor["PodMonitor"]
+    PodMonitor --> Prometheus["Prometheus"]
+    Prometheus --> Grafana["Grafana alerting"]
+    Grafana -->|"firing / resolved"| Telegram["Telegram bot"]
+    NetPol["CiliumNetworkPolicy"] -.->|isolates| Deployment
+```
 
 ---
 
@@ -100,6 +148,49 @@ Current tenants (both environments): `luffy`, `zoro`, `nami`.
 - **`db_instances = 1` in both environments** — reduced from the module's HA default of 3 due to a demo-environment vCPU quota constraint, not a design choice; the module still defaults to 3 for future capacity.
 - **Cilium network policy egress is scoped per customer's own CNPG cluster label** — one tenant's n8n pod cannot reach another tenant's database even though they share the same cluster and CNI.
 - **SAS tokens and Telegram credentials use `lifecycle { ignore_changes }`** — so `terraform apply` doesn't churn secrets that are meant to be rotated manually or regenerate on every plan.
+
+---
+
+## 🛠️ Engineering Challenges
+
+Real problems hit while building and operating this, not tutorial steps.
+
+### 1. Nested Git Repository
+**Issue:** Accidentally initialized a second git repo inside the `gitops/` subdirectory, making all GitOps manifests invisible to the outer repo. Flux couldn't find any paths after push.
+**Solution:** Removed the nested `.git` folder, moved all manifests to repo root, updated `gitops_repo_path` in Terraform to match.
+
+### 2. Tailscale IPv6 DNS Breaking Terraform Init
+**Issue:** `terraform init` failed to reach `registry.terraform.io` due to a misbehaving IPv6 DNS server injected by Tailscale.
+**Solution:** Overrode `/etc/resolv.conf` with Google DNS (`8.8.8.8`) to force IPv4 resolution.
+
+### 3. Kubernetes Version in LTS-Only Tier
+**Issue:** AKS rejected version `1.32.1` as it requires the Premium/LTS support plan in Canada Central.
+**Solution:** Queried supported versions with `az aks get-versions --location canadacentral` and pinned to `1.34.8`.
+
+### 4. Provider Binary Committed to Git
+**Issue:** Running `terraform init` before creating `.gitignore` committed the 231MB Azure provider binary. GitHub rejected the push.
+**Solution:** Used `git filter-branch` to purge the binary from git history. Added `.gitignore` with `**/.terraform/` before any future `terraform init`.
+
+### 5. Cross-Namespace HelmRelease Blocked by Flux
+**Issue:** The Barman Cloud plugin `HelmRelease` was placed in `cnpg-system` namespace but referenced a `HelmRepository` in `flux-system`. Flux blocks cross-namespace source references by default.
+**Solution:** Moved the `HelmRelease` metadata to `flux-system` namespace (keeping `targetNamespace: cnpg-system`). Also had to manually delete the stale object since Kubernetes resources cannot change namespace in-place.
+
+### 6. Invalid Helm Chart Version Syntax
+**Issue:** Used `version: "0.x"` for the Barman plugin chart, which is not valid semver. The `HelmRelease` was silently never processed (`Observed Generation: -1`).
+**Solution:** Queried available versions with `helm search repo cnpg/plugin-barman-cloud --versions` and pinned to `0.7.0`.
+
+### 7. Traefik IngressClass Name Mismatch
+**Issue:** Traefik chart v33 creates an `IngressClass` named `traefik-traefik` by default, but all ingress manifests used `ingressClassName: traefik`. Traefik ignored all ingresses, served its default self-signed cert, and returned 404 for all routes.
+**Detection:** `kubectl get ingressclass` revealed the mismatch. `openssl s_client` confirmed Traefik was serving `CN=TRAEFIK DEFAULT CERT` instead of the Let's Encrypt cert.
+**Solution:** Upgraded to Traefik chart `37.4.0` and explicitly set `ingressClass.name: traefik` in values to match ingress manifests.
+
+### 8. Node Disk Volume Limit Exhausted
+**Issue:** `Standard_D2s_v3` nodes allow a maximum of 4 data disks each. With 3 customers × 3 DB replicas + 3 n8n PVCs = 12 PVCs across 3 nodes, all disk slots were exhausted. Prometheus could not schedule its PVC.
+**Attempted fix:** Increasing node count to 4 failed due to insufficient vCPU quota in Canada Central (2 vCPUs remaining, needed 4).
+**Solution:** Reduced `db_instances` to 1 per customer for the demo environment. Patched running CNPG clusters directly since Kubernetes resources can't simply be re-applied to scale down:
+```bash
+kubectl patch cluster luffy-db -n luffy --type merge -p '{"spec":{"instances":1}}'
+```
 
 ---
 
