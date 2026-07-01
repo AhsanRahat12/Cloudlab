@@ -9,7 +9,7 @@ spec:
   chart:
     spec:
       chart: traefik
-      version: "33.x"
+      version: "37.4.0"
       sourceRef:
         kind: HelmRepository
         name: traefik
@@ -19,13 +19,4 @@ spec:
     createNamespace: true
   values:
     ingressClass:
-      enabled: true
-      isDefaultClass: true
-    providers:
-      kubernetesCRD:
-        enabled: true
-        allowCrossNamespace: true
-      kubernetesIngress:
-        enabled: true
-        publishedService:
-          enabled: true
+      name: traefik
