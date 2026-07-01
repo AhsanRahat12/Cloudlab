@@ -16,7 +16,7 @@ data:
             type: telegram
             settings:
               bottoken: $TELEGRAM_BOT_TOKEN
-              chatid: "YOUR_CHAT_ID"
+              chatid: "8649335358"
               message: |
                 {{ if eq .Status "firing" }}🔥 FIRING{{ else if eq .Status "resolved" }}✅ RESOLVED{{ else }}⚠️ {{ .Status | toUpper }}{{ end }}
                 {{ range .Alerts }}
