@@ -22,6 +22,8 @@ module "customer" {
 
   customer_name = each.key
   environment   = local.environment
+  # Sizing (use defaults, override per-customer if needed)
+  db_instances     = 1
 
   key_vault_id                              = azurerm_key_vault.cloudlab_vault.id
   storage_account_id                        = azurerm_storage_account.cnpg_backups.id
