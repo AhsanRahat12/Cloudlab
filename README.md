@@ -1,5 +1,9 @@
 # ☁️ Cloudlab
 
+[![Terraform](https://img.shields.io/badge/Terraform-%3E%3D1.0-844FBA?logo=terraform&logoColor=white)](https://www.terraform.io/)
+[![Kubernetes](https://img.shields.io/badge/Kubernetes-1.34.8-326CE5?logo=kubernetes&logoColor=white)](https://kubernetes.io/)
+[![Flux](https://img.shields.io/badge/Flux-GitOps-5468FF?logo=flux&logoColor=white)](https://fluxcd.io/)
+
 Multi-tenant SaaS platform on Azure AKS — Terraform provisions the cloud infrastructure and generates the GitOps manifests, Flux syncs them to the cluster. Onboarding a new customer is a one-line change to a Terraform list.
 
 > **Note on cost:** this cluster does not run 24/7. It's a demo/portfolio environment — spun up with `terraform apply` to demonstrate or test, then torn down with `terraform destroy` to avoid paying for idle AKS nodes and Azure resources around the clock.
@@ -55,8 +59,42 @@ flowchart TB
 | CloudNative-PG | PostgreSQL operator — one dedicated cluster per customer |
 | Barman Cloud plugin | Continuous WAL archiving and scheduled backups to Azure Blob Storage |
 | n8n | Workflow automation app — the actual product each customer runs |
-| kube-prometheus-stack | Prometheus + Grafana + Alertmanager |
-| Grafana alerting | Provisioned contact points/policies — routes to Telegram |
+| kube-prometheus-stack | Prometheus + Grafana |
+| Grafana alerting | Alertmanager is disabled — Grafana's built-in alerting handles rules, contact points, and routing to Telegram |
+
+---
+
+## 🚀 How to Run
+
+Prerequisites: `az login`, Terraform >= 1.0, `kubectl`, Flux CLI (optional, for manual reconciles).
+
+```bash
+# 1. Register the Flux extension provider (one-time per subscription)
+az provider register --namespace Microsoft.KubernetesConfiguration
+
+# 2. Provision the environment — creates the AKS cluster, Key Vault, storage account,
+#    the Flux extension, and apps/staging/<customer>/ manifests for everyone in customers.tf
+cd staging
+terraform init
+terraform apply
+
+# 3. Get cluster credentials
+az aks get-credentials --resource-group rg-cloudlab-aks --name cloudlab-staging
+
+# 4. Point DNS at the Traefik LoadBalancer IP
+kubectl get svc -n traefik traefik -o jsonpath='{.status.loadBalancer.ingress[0].ip}'
+# create a wildcard A record: *.cloudlab.<your-domain> -> that IP
+
+# 5. Commit and push the manifests Terraform just generated
+git add apps/staging && git commit -m "onboard customers" && git push
+
+# 6. Force an immediate sync instead of waiting on the 5-minute interval
+flux reconcile source git cloudlab-staging
+```
+
+If the cluster was recreated, `terraform apply` prints a reminder (`gitops_identity_reminder` output) to update the AKS Key Vault identity in `monitoring/controllers/<env>/kube-prometheus-stack/kustomization.yaml`.
+
+Tear down with `terraform destroy` from the same directory — the normal way to stop paying for it between demos, see the cost note above.
 
 ---
 
@@ -101,7 +139,7 @@ Each entry in `customers.tf`'s `customers` set produces, via `modules/customer-o
 
 Terraform writes each customer's directory itself, then regenerates the environment's `kustomization.yaml` listing every customer — so the file that wires everything into Flux is never hand-edited.
 
-Current tenants (both environments): `luffy`, `zoro`, `nami`.
+Demo tenants (both environments, fictional): `luffy`, `zoro`, `nami`.
 
 ---
 
