@@ -144,6 +144,16 @@ Adding a name to `customers.tf` produces, via `modules/customer-onboarding`:
 - **Cloud resources** — a private storage container for backups, a time-limited access token, and secrets in Key Vault for the app's login and Telegram alerts.
 - **Everything needed to run their app** (`apps/<env>/<customer>/`) — a namespace, a database with automatic backups, the app itself, a public URL with HTTPS, network rules that wall them off from other customers, and a metrics hook.
 
+Exact list of what gets generated:
+
+- Namespace, locked down with Kubernetes' strictest security profile (`restricted`)
+- `SecretProviderClass` pulling all 6 secrets from Key Vault
+- CNPG `Cluster` + `ObjectStore` + `ScheduledBackup` (daily, 14-day retention)
+- n8n `Deployment` (non-root, read-only filesystem, no extra permissions) + `Service` + persistent volume
+- Traefik `Ingress` with automatic HTTPS at `<customer>.cloudlab.rahatahsan.com`
+- `CiliumNetworkPolicy` — only Traefik can reach the app in, only the customer's own database can be reached out
+- `PodMonitor` for database metrics
+
 Terraform writes each customer's directory itself, then regenerates the environment's `kustomization.yaml` listing every customer — so the file that wires everything into Flux is never hand-edited.
 
 Demo tenants (both environments, fictional): `luffy`, `zoro`, `nami`.
