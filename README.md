@@ -4,7 +4,7 @@
 [![Kubernetes](https://img.shields.io/badge/Kubernetes-1.34.8-326CE5?logo=kubernetes&logoColor=white)](https://kubernetes.io/)
 [![Flux](https://img.shields.io/badge/Flux-GitOps-5468FF?logo=flux&logoColor=white)](https://fluxcd.io/)
 
-Multi-tenant SaaS platform on Azure AKS — Terraform provisions the cloud infrastructure and generates the GitOps manifests, Flux syncs them to the cluster. Onboarding a new customer is a one-line change to a Terraform list.
+A cloud platform where every customer gets their own isolated app, database, and backups — running on Azure Kubernetes, provisioned by Terraform, and kept in sync automatically by Flux. Adding a new customer is a one-line change.
 
 > **Note on cost:** this cluster does not run 24/7. It's a demo/portfolio environment — spun up with `terraform apply` to demonstrate or test, then torn down with `terraform destroy` to avoid paying for idle AKS nodes and Azure resources around the clock.
 
@@ -16,11 +16,11 @@ Multi-tenant SaaS platform on Azure AKS — Terraform provisions the cloud infra
 
 **Two layers, two tools, one boundary.**
 
-- **Terraform owns everything with state** — the AKS cluster, node pools, Key Vault, storage accounts, secrets, per-customer Azure resources.
-- **Flux owns everything that's just declarative YAML** — workloads, ingress, network policy, monitoring. Terraform writes that YAML into this repo as a side effect of provisioning a customer; it never talks to the Kubernetes API directly.
-- **Onboarding is one Terraform module, invoked once per customer name.** Add a string to a list and run `terraform apply` — Terraform creates the Azure Blob container, Key Vault secrets, and 13 Kubernetes manifests, then regenerates the kustomization that wires the new customer into Flux.
-- **Staging and production are fully isolated, not overlays of a shared base** — separate Terraform root modules, separate AKS clusters, separate Key Vaults, separate storage accounts. A mistake in staging can't touch production state.
-- **Every customer is the same shape** — a Postgres database (CloudNative-PG) plus an n8n instance, network-isolated with Cilium, backed up continuously to Azure Blob, deployed under Pod Security Standards `restricted` from day one.
+- **Terraform builds the cloud infrastructure** — the Kubernetes cluster, the secrets vault, storage, and every customer's cloud resources.
+- **Flux keeps the cluster in sync with this repo** — it applies app configs, network rules, and monitoring automatically. Nothing gets deployed by hand.
+- **Onboarding a customer is one line in a list.** Terraform creates their cloud resources and all their Kubernetes config files, and updates the file that tells Flux about them — no one writes that config by hand.
+- **Staging and production never touch each other** — separate clusters, separate vaults, separate storage. A mistake in one can't reach the other.
+- **Every customer gets the identical setup** — their own database, their own app, walled off from other customers on the network, backed up continuously, and locked down with Kubernetes' strictest security profile from day one.
 
 ---
 
@@ -50,19 +50,19 @@ flowchart TB
 
 | Tool | Purpose |
 |------|---------|
-| Terraform | Provisions AKS, Key Vault, storage, and per-customer Azure resources; generates GitOps manifests |
-| AKS | Managed Kubernetes — system pool tainted `CriticalAddonsOnly`, user pool for workloads |
-| Flux | GitOps controller — deployed as an AKS extension, syncs cluster state from this repo |
-| Kustomize | Environment-specific configuration and overlays |
-| Cilium | CNI + network policy — per-customer network isolation |
-| Traefik | Ingress controller |
-| cert-manager | Automated TLS via Let's Encrypt |
-| Azure Key Vault + CSI driver | Secret storage — synced into pods via `SecretProviderClass`, no secrets in Git |
-| CloudNative-PG | PostgreSQL operator — one dedicated cluster per customer |
-| Barman Cloud plugin | Continuous WAL archiving and scheduled backups to Azure Blob Storage |
-| n8n | Workflow automation app — the actual product each customer runs |
-| kube-prometheus-stack | Prometheus + Grafana |
-| Grafana alerting | Alertmanager is disabled — Grafana's built-in alerting handles rules, contact points, and routing to Telegram |
+| Terraform | Builds the cloud infrastructure and generates each customer's Kubernetes config |
+| AKS | Azure's managed Kubernetes — runs the cluster; system components and customer apps use separate node pools so one can't starve the other |
+| Flux | Watches this Git repo and automatically applies changes to the cluster |
+| Kustomize | Reuses the same Kubernetes config across staging and production with small per-environment tweaks |
+| Cilium | Handles pod networking and the firewall rules between customers |
+| Traefik | Routes incoming web traffic to the right customer's app |
+| cert-manager | Automatically issues and renews HTTPS certificates |
+| Azure Key Vault + CSI driver | Stores passwords and tokens outside of Git, mounted into pods securely at startup |
+| CloudNative-PG | Runs and manages a dedicated Postgres database for each customer |
+| Barman Cloud plugin | Continuously backs up each customer's database to cloud storage |
+| n8n | The workflow-automation app each customer actually uses |
+| kube-prometheus-stack | Collects cluster metrics (Prometheus) and displays them (Grafana) |
+| Grafana alerting | Sends an alert to Telegram when something breaks (Alertmanager is disabled — Grafana handles this directly) |
 
 ---
 
@@ -102,6 +102,9 @@ Tear down with `terraform destroy` from the same directory — the normal way to
 
 ## 📁 Repository Structure
 
+<details>
+<summary>Click to view the full layout ▶</summary>
+
 ```
 Cloudlab/
 ├── staging/                        ← Terraform root module — staging AKS cluster
@@ -127,16 +130,31 @@ Cloudlab/
     └── configs/{base,staging,production}/       ← Grafana alert rules, contact points, notification policies
 ```
 
-Flux watches five dependency-chained Kustomizations per environment: `infra-controllers` → `infra-configs` → `cnpg-plugin` → `apps` → `monitoring-controllers` → `monitoring-configs`. Apps wait on the CNPG plugin because every customer's database backup config depends on it being ready.
+</details>
+
+Flux applies these in order, each one waiting for the last: controllers → configs → database backup plugin → customer apps → monitoring. Apps wait for the backup plugin because every customer's database depends on it being ready first.
 
 ---
 
 ## 👥 Customer Model
 
-Each entry in `customers.tf`'s `customers` set produces, via `modules/customer-onboarding`:
+Adding a name to `customers.tf` produces, via `modules/customer-onboarding`:
 
-- **Azure resources** — a private Blob container for backups, a 2-year SAS token, and 6 Key Vault secrets (db user/password, blob SAS, Telegram bot token/chat ID).
-- **Kubernetes manifests** (`apps/<env>/<customer>/`) — namespace (PSS `restricted`), `SecretProviderClass` pulling all 6 secrets from Key Vault, CNPG `Cluster` + `ObjectStore` + `ScheduledBackup` (daily, 14-day retention), n8n `Deployment` (non-root, read-only rootfs, all capabilities dropped) + `Service` + PVC, Traefik `Ingress` with automatic TLS at `<customer>.cloudlab.rahatahsan.com`, a `CiliumNetworkPolicy` restricting ingress to Traefik and egress to the customer's own database plus DNS and HTTPS, and a `PodMonitor` for CNPG metrics.
+- **Cloud resources** — a private storage container for backups, a time-limited access token, and secrets in Key Vault for the app's login and Telegram alerts.
+- **Everything needed to run their app** (`apps/<env>/<customer>/`) — a namespace, a database with automatic backups, the app itself, a public URL with HTTPS, network rules that wall them off from other customers, and a metrics hook.
+
+<details>
+<summary>Exact list of what gets generated ▶</summary>
+
+- Namespace, locked down with Kubernetes' strictest security profile (`restricted`)
+- `SecretProviderClass` pulling all 6 secrets from Key Vault
+- CNPG `Cluster` + `ObjectStore` + `ScheduledBackup` (daily, 14-day retention)
+- n8n `Deployment` (non-root, read-only filesystem, no extra permissions) + `Service` + persistent volume
+- Traefik `Ingress` with automatic HTTPS at `<customer>.cloudlab.rahatahsan.com`
+- `CiliumNetworkPolicy` — only Traefik can reach the app in, only the customer's own database can be reached out
+- `PodMonitor` for database metrics
+
+</details>
 
 Terraform writes each customer's directory itself, then regenerates the environment's `kustomization.yaml` listing every customer — so the file that wires everything into Flux is never hand-edited.
 
@@ -171,63 +189,95 @@ Once Flux reconciles the namespace, database, and n8n deployment (usually under 
 
 ## 📊 Infrastructure & Data
 
-- **Compute** — AKS with a tainted system pool (`CriticalAddonsOnly`) isolating control-plane-adjacent workloads from a separate user pool where all customer and app workloads land. Automatic patch-level upgrades and node OS image upgrades, both confined to a weekly Sunday 02:00 UTC maintenance window.
-- **Secrets** — Azure Key Vault is the single source of truth. The AKS Key Vault Secrets Provider (managed identity) mounts secrets into pods via CSI `SecretProviderClass` — nothing sensitive is committed to Git, even encrypted.
-- **Backups** — each customer's Postgres cluster streams WAL continuously to its own private Blob container via the Barman Cloud plugin, with daily scheduled backups and 14-day retention — isolated per tenant, so one customer's backup volume or access can't affect another's.
-- **Monitoring** — kube-prometheus-stack per environment. Grafana alert rules cover node health, pod health, CNPG operator health, per-customer database health, and n8n health, routed through a provisioned Telegram contact point with a 4-hour repeat interval.
+- **Compute** — critical system components and customer apps run on separate machine pools, so a busy customer can't starve the cluster's core services. Upgrades happen automatically, but only during a weekly maintenance window.
+- **Secrets** — passwords and tokens live in Azure Key Vault, never in this repo, even encrypted. Kubernetes pulls them in securely at startup.
+- **Backups** — every customer's database streams a continuous backup to its own private cloud storage, with daily snapshots kept for two weeks. One customer's backups can't affect another's.
+- **Monitoring** — every environment has its own dashboard and alerting. If a customer's app, database, or a cluster node has a problem, an alert reaches Telegram within minutes.
 
 ---
 
 ## 🔥 Notable Decisions
 
-- **Terraform generates GitOps YAML instead of a Helm chart or templating engine** — every customer's manifests are plain, readable YAML committed to Git, not rendered at apply time from a template a human has to mentally expand.
-- **No shared `base/` for customer apps** — each environment's customer manifests are fully self-contained. Staging and production customers can diverge (sizing, instance count) without an overlay abstraction to fight.
-- **`db_instances = 1` in both environments** — reduced from the module's HA default of 3 due to a demo-environment vCPU quota constraint, not a design choice; the module still defaults to 3 for future capacity.
-- **Cilium network policy egress is scoped per customer's own CNPG cluster label** — one tenant's n8n pod cannot reach another tenant's database even though they share the same cluster and CNI.
-- **SAS tokens and Telegram credentials use `lifecycle { ignore_changes }`** — so `terraform apply` doesn't churn secrets that are meant to be rotated manually or regenerate on every plan.
+- **Terraform generates the Kubernetes config files instead of templating them** — every customer's setup is plain, readable YAML committed to Git, not hidden behind a template someone has to mentally expand.
+- **No shared config between environments** — staging and production customers are fully self-contained, so they can differ in size without fighting a shared template.
+- **Each customer runs a single database instance, not three** — reduced from the usual high-availability default because of an Azure vCPU limit on this demo account, not a design choice. Production capacity just needs a quota increase to restore it.
+- **One customer's app cannot reach another customer's database** — network rules are scoped per customer even though everyone shares the same cluster.
+- **Some secrets are set once and left alone** — access tokens and chat IDs are marked "don't touch," so a routine `terraform apply` doesn't quietly rotate something meant to stay stable.
 
 ---
 
 ## 🔧 Engineering Challenges
 
-Real problems hit while building and operating this, not tutorial steps.
+Real problems I hit while building and running this — not tutorial steps. Eight of them, click each to expand.
 
-### 1. Nested Git Repository
+<details>
+<summary><b>1. A second Git repo hid all the config from Flux</b></summary>
+
 **Issue:** Accidentally initialized a second git repo inside the `gitops/` subdirectory, making all GitOps manifests invisible to the outer repo. Flux couldn't find any paths after push.
 **Solution:** Removed the nested `.git` folder, moved all manifests to repo root, updated `gitops_repo_path` in Terraform to match.
 
-### 2. Tailscale IPv6 DNS Breaking Terraform Init
+</details>
+
+<details>
+<summary><b>2. Tailscale's DNS silently broke Terraform</b></summary>
+
 **Issue:** `terraform init` failed to reach `registry.terraform.io` due to a misbehaving IPv6 DNS server injected by Tailscale.
 **Solution:** Overrode `/etc/resolv.conf` with Google DNS (`8.8.8.8`) to force IPv4 resolution.
 
-### 3. Kubernetes Version in LTS-Only Tier
+</details>
+
+<details>
+<summary><b>3. Wrong Kubernetes version required a paid support tier</b></summary>
+
 **Issue:** AKS rejected version `1.32.1` as it requires the Premium/LTS support plan in Canada Central.
 **Solution:** Queried supported versions with `az aks get-versions --location canadacentral` and pinned to `1.34.8`.
 
-### 4. Provider Binary Committed to Git
-**Issue:** Running `terraform init` before creating `.gitignore` committed the 231MB Azure provider binary. GitHub rejected the push.
+</details>
+
+<details>
+<summary><b>4. A 231MB binary got committed to Git</b></summary>
+
+**Issue:** Running `terraform init` before creating `.gitignore` committed the Azure provider binary. GitHub rejected the push.
 **Solution:** Used `git filter-branch` to purge the binary from git history. Added `.gitignore` with `**/.terraform/` before any future `terraform init`.
 
-### 5. Cross-Namespace HelmRelease Blocked by Flux
-**Issue:** The Barman Cloud plugin `HelmRelease` was placed in `cnpg-system` namespace but referenced a `HelmRepository` in `flux-system`. Flux blocks cross-namespace source references by default.
-**Solution:** Moved the `HelmRelease` metadata to `flux-system` namespace (keeping `targetNamespace: cnpg-system`). Also had to manually delete the stale object since Kubernetes resources cannot change namespace in-place.
+</details>
 
-### 6. Invalid Helm Chart Version Syntax
-**Issue:** Used `version: "0.x"` for the Barman plugin chart, which is not valid semver. The `HelmRelease` was silently never processed (`Observed Generation: -1`).
+<details>
+<summary><b>5. Flux silently refused a cross-namespace reference</b></summary>
+
+**Issue:** The database backup plugin's Helm release was defined in the `cnpg-system` namespace but pointed at a chart repository registered in `flux-system`. Flux blocks that kind of cross-namespace reference by default.
+**Solution:** Moved the release's metadata into `flux-system` (its target namespace stayed `cnpg-system`). Also had to manually delete the stale object, since Kubernetes won't move an existing resource to a new namespace in-place.
+
+</details>
+
+<details>
+<summary><b>6. An invalid version string made a Helm release silently do nothing</b></summary>
+
+**Issue:** Used `version: "0.x"` for the backup plugin's Helm chart, which isn't valid semver. Flux never processed it — no error, just nothing happening.
 **Solution:** Queried available versions with `helm search repo cnpg/plugin-barman-cloud --versions` and pinned to `0.7.0`.
 
-### 7. Traefik IngressClass Name Mismatch
-**Issue:** Traefik chart v33 creates an `IngressClass` named `traefik-traefik` by default, but all ingress manifests used `ingressClassName: traefik`. Traefik ignored all ingresses, served its default self-signed cert, and returned 404 for all routes.
-**Detection:** `kubectl get ingressclass` revealed the mismatch. `openssl s_client` confirmed Traefik was serving `CN=TRAEFIK DEFAULT CERT` instead of the Let's Encrypt cert.
-**Solution:** Upgraded to Traefik chart `37.4.0` and explicitly set `ingressClass.name: traefik` in values to match ingress manifests.
+</details>
 
-### 8. Node Disk Volume Limit Exhausted
-**Issue:** `Standard_D2s_v3` nodes allow a maximum of 4 data disks each. With 3 customers × 3 DB replicas + 3 n8n PVCs = 12 PVCs across 3 nodes, all disk slots were exhausted. Prometheus could not schedule its PVC.
-**Attempted fix:** Increasing node count to 4 failed due to insufficient vCPU quota in Canada Central (2 vCPUs remaining, needed 4).
-**Solution:** Reduced `db_instances` to 1 per customer for the demo environment. Patched running CNPG clusters directly since Kubernetes resources can't simply be re-applied to scale down:
+<details>
+<summary><b>7. Every customer got a 404 with the wrong TLS certificate</b></summary>
+
+**Issue:** The Traefik chart version in use creates an ingress class named `traefik-traefik` by default, but every ingress manifest referenced `traefik`. Traefik ignored all of them, served its own self-signed certificate, and returned 404 everywhere.
+**Detection:** `kubectl get ingressclass` showed the mismatch; `openssl s_client` confirmed Traefik was serving its default cert instead of the real one.
+**Solution:** Upgraded Traefik and explicitly set the ingress class name in its config to match the manifests.
+
+</details>
+
+<details>
+<summary><b>8. Ran out of disk slots for a 4th node</b></summary>
+
+**Issue:** Each node type in use allows a maximum of 4 attached disks. With 3 customers × 3 database replicas + 3 app volumes = 12 volumes spread across 3 nodes, every disk slot was full — Prometheus couldn't get one for itself.
+**Attempted fix:** Adding a 4th node failed — not enough spare CPU quota left in the region.
+**Solution:** Dropped each customer to a single database instance for this demo environment, and patched the already-running databases directly since Kubernetes won't scale them down just by re-applying the config:
 ```bash
 kubectl patch cluster luffy-db -n luffy --type merge -p '{"spec":{"instances":1}}'
 ```
+
+</details>
 
 ---
 
