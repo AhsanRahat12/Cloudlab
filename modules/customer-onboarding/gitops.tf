@@ -451,31 +451,6 @@ resource "local_file" "podmonitor" {
   depends_on = [local_file.directory_marker]
 }
 
-# 11. CNPG PodMonitor for Prometheus metrics
-resource "local_file" "podmonitor" {
-  filename = "${local.customer_path}/podmonitor.yaml"
-  content  = <<-YAML
-    apiVersion: monitoring.coreos.com/v1
-    kind: PodMonitor
-    metadata:
-      name: ${var.customer_name}-cnpg
-      namespace: ${var.customer_name}
-      labels:
-        app: cnpg
-    spec:
-      namespaceSelector:
-        matchNames:
-          - ${var.customer_name}
-      selector:
-        matchLabels:
-          cnpg.io/cluster: ${var.customer_name}-db
-      podMetricsEndpoints:
-        - port: metrics
-          path: /metrics
-  YAML
-  depends_on = [local_file.directory_marker]
-}
-
 # 12. PersistentVolumeClaim for n8n data
 resource "local_file" "storage" {
   filename = "${local.customer_path}/storage.yaml"
